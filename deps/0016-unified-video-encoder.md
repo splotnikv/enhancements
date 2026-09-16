@@ -16,164 +16,79 @@
 
 **Review Date**: [Date for review]
 
-
 **Implementation PR / Tracking Issue**: https://github.com/ai-dynamo/dynamo/pull/11121
 
 # Summary
 
-Dynamo currently serves video generation through three independent backends —
-**vLLM** (via vLLM-Omni), **TensorRT-LLM**, and **SGLang**. Each backend
-re-implements the final "raw frames → encoded video" step in its own way, with
-its own codec, hardware assumptions, and code path. This document proposes a
-single, shared video-encoding layer in `dynamo.common` that all three backends
-call. The goal is to **unify encoding** so that codec, container, and hardware
-support are implemented once, are consistent across backends, and are trivial to
-extend (new codecs, new accelerators) without touching backend-specific code.
+Dynamo serves video generation through three backends — **vLLM** (via vLLM-Omni),
+**TensorRT-LLM**, and **SGLang** — and each one re-implements the final "raw
+frames → encoded video" step with its own codec and hardware assumptions. This
+DEP replaces those three implementations with a single shared encoder,
+`dynamo.common.utils.video_utils.encode_video()`, that takes one canonical frame
+format and emits mp4 bytes.
+
+The encoder ships two royalty-free encoders and no codec matrix: **software VP9
+by default**, and **hardware AV1 over VA-API** when the operator points
+`DYN_XPU_FFMPEG_PATH` at a VA-API-capable ffmpeg.
 
 # Motivation
 
-The three video backends share the same frontend, request schema, and storage
-layer, but each ships its own frames→bytes encoder with divergent codecs,
-hardware assumptions, and duplicated logic. This makes adding a codec, container,
-or hardware accelerator (e.g. Intel XPU / VA-API) an N-times change and produces
-inconsistent output across backends. Consolidating the single divergent step
-into one shared encoder removes the duplication and makes hardware/codec support
-a one-place change.
+The three backends share the frontend, the request schema, and the storage layer.
+Encoding is the only genuinely divergent step, so adding hardware or a codec is
+an N-times change today and produces inconsistent output across backends.
+
+The first draft of this DEP proposed preserving the existing NVENC H.264 path and
+adding HEVC alongside it. That is no longer possible: upstream PR #11836 removed
+every royalty-bearing encoder from the shipped images, including `h264_nvenc`,
+and added a build-time gate (`container/compliance/`) that fails the build if one
+returns. The in-tree ffmpeg is now LGPL-only. So the unified encoder is not
+"everything we had, plus more" — it is a **narrower, royalty-free codec surface**
+that happens to be identical across all three backends, with hardware encode
+reached through AV1 rather than H.264.
 
 ## Goals
 
-* Unify the frames→bytes encode step for all three backends behind one shared
-  entry point in `dynamo.common`.
-* Preserve existing NVIDIA (NVENC) behavior unchanged.
-* Make new hardware (XPU) and new codecs (notably HEVC) a single-place addition.
-* Expose encoding controls (codec / container / HW accel / device) via
-  environment variables.
+* One shared frames→bytes entry point for all three backends.
+* A single narrow input contract, so the shared layer holds no backend knowledge.
+* Hardware encode on Intel XPU without reintroducing a royalty-bearing codec.
+* Deployment-time selection of the encoder, with no silent fallback.
 
 ### Non Goals
 
-* Changing the frontend, request schema, or the storage/persistence layer.
-* Per-backend CLI flags (may be layered on later).
-* Removing the legacy helper functions in this change.
+* Changing the frontend, request schema, or storage layer.
+* Any codec or container choice exposed to the caller or the request.
+* Capability auto-detection.
+* Removing the superseded helpers (`encode_to_mp4`, `encode_to_video_bytes`,
+  `normalize_video_frames`, `frames_to_numpy`) — they retain their tests and no
+  longer sit on any request path, but deleting them is a separate cleanup.
 
 # Proposal
 
-## Current Architecture
+## Current implementation
 
-The video request travels through five stages. Stages 1 and 5 are **already
-shared** by all three backends; stages 2–4 are where they diverge.
+Stages before and after encoding are already shared: the frontend routes
+`/v1/videos`, `NvCreateVideoRequest` / `VideoNvExt` is the common schema, and
+`upload_to_fs()` persists the bytes. Only the encode step diverges.
 
-### Table 1 — Request handling (frontend → backend handler)
-
-| Stage | vLLM | TensorRT-LLM | SGLang |
+| | vLLM (vLLM-Omni) | TensorRT-LLM | SGLang |
 |---|---|---|---|
-| HTTP / prompt processing | Dynamo Frontend (`dynamo.frontend`, OpenAI-compatible) | *same* | *same* |
-| Shared request protocol | `NvCreateVideoRequest` / `VideoNvExt` (`dynamo.common.protocols`) | *same* | *same* |
-| Backend entry point | `OmniHandler.generate()` | `VideoGenerationHandler.generate()` | `VideoGenerationWorkerHandler.generate()` |
+| Encode call | `DiffusionFormatter._encode_video()` | `encode_to_video_bytes()` (shared helper) | `_frames_to_video()`, inline in the handler |
+| Mechanism | diffusers `export_to_video` → ffmpeg | `imageio.v3.imwrite` → ffmpeg | `imageio.get_writer` → ffmpeg |
+| Codec | H.264, software | H.264 NVENC; VP9 for webm | H.264 NVENC |
+| Native frame type | `stage_output.images`, a list holding one 5-D array | `torch.Tensor (1, T, H, W, C)` uint8 | `list[PIL.Image \| np.ndarray]` |
 
-> All three share the **same frontend and request schema**. The frontend routes
-> `/v1/videos` to the appropriate worker endpoint; only the handler class differs.
+Three encoders, three native frame layouts, and codec choices that no longer
+exist in the shipped images.
 
-### Table 2 — Generation (who produces the frames)
-
-| | vLLM | TensorRT-LLM | SGLang |
-|---|---|---|---|
-| Generation call | `AsyncOmni.generate()` | `DiffusionEngine.generate()` | `DiffGenerator.generate()` |
-| Owning package | `vllm_omni` | `dynamo.trtllm` (wraps `tensorrt_llm._torch.visual_gen`) | `sglang.multimodal_gen` |
-
-> The call site for all three is **inside Dynamo handler code** — raw pixels are
-> returned across the package boundary into Dynamo, which is what makes a shared
-> Dynamo-side encoder possible without any upward dependency.
-
-### Table 3 — Raw pixel output format
-
-| | vLLM | TensorRT-LLM | SGLang |
-|---|---|---|---|
-| Type | `stage_output.images` — `list` (may hold one 5-D array) | `torch.Tensor` `(1, T, H, W, C)` `uint8` | `list[PIL.Image \| np.ndarray]` |
-| Normalization helper | `normalize_video_frames()` | `video[0].cpu().numpy()` | per-frame `np.array(...)` |
-
-> Three different in-memory shapes/types are produced. Each backend's own
-> `to_canonical()` converter absorbs *its* shape into the canonical format, so
-> only the canonical `np.ndarray (T, H, W, 3) uint8` ever reaches the shared
-> encoder.
-
-### Table 4 — Encoding (frames → bytes)
-
-| | vLLM | TensorRT-LLM | SGLang |
-|---|---|---|---|
-| Encode function | `DiffusionFormatter._encode_video()` | `encode_to_video_bytes()` (`dynamo.common.utils.video_utils`) | `_frames_to_video()` (inline) |
-| Encoder library | diffusers `export_to_video` → **ffmpeg** | `imageio.v3.imwrite(buffer, frames, extension=".mp4", codec="h264_nvenc")` → **ffmpeg** | `imageio.get_writer(buffer, format="mp4", codec="h264_nvenc")` → **ffmpeg** |
-| Codec / HW | H.264 (libx264, **software**) | H.264 (**NVENC**), VP9 (`libvpx-vp9`) for webm | H.264 (**NVENC**) |
-| Container(s) | mp4 | mp4 (webm code-capable) | mp4 |
-
-> All three ultimately call **ffmpeg** (through imageio or diffusers). Only
-> TensorRT-LLM uses the shared helper; SGLang duplicates equivalent logic inline,
-> and vLLM has its own path. Containers other than mp4 are rejected by the
-> handlers today even where the encoder could produce them.
-
-### Table 5 — Persisting the encoded bitstream
-
-| | vLLM | TensorRT-LLM | SGLang |
-|---|---|---|---|
-| Disk / object write | `upload_to_fs()` → `fs.pipe()` (`dynamo.common.storage`) | *same* | *same* |
-| Backend (fsspec) | `DirFileSystem`; `file://` → local disk, `s3://`/`gs://` → object store | *same* | *same* |
-| Response wrapping | `VideoData(url=… \| b64_json=…)` | *same* | *same* |
-
-> Persistence is **already unified**. The encoders only produce bytes; the
-> storage layer decides where the bytes land. (The unused `encode_to_mp4()`
-> file-path variant bypasses this and is dead code.)
-
-### Current flow chart
+## Proposed architecture
 
 ```mermaid
 graph LR
-    P[Prompt /v1/videos] --> FE[Dynamo Frontend<br/>shared]
+    V[vLLM frames] --> Cv[dynamo.vllm<br/>to_canonical]
+    T[TRT-LLM frames] --> Ct[dynamo.trtllm<br/>to_canonical]
+    S[SGLang frames] --> Cs[dynamo.sglang<br/>to_canonical]
 
-    FE --> V[vLLM<br/>AsyncOmni.generate]
-    FE --> T[TRT-LLM<br/>DiffusionEngine.generate]
-    FE --> S[SGLang<br/>DiffGenerator.generate]
-
-    V --> Ev[export_to_video<br/>ffmpeg / software H.264]
-    T --> Et[imageio + ffmpeg<br/>NVENC H.264]
-    S --> Es[imageio + ffmpeg<br/>NVENC H.264]
-
-    Ev --> W[upload_to_fs / fs.pipe<br/>shared]
-    Et --> W
-    Es --> W
-    W --> D[(file:// / s3:// …)]
-```
-
-The fork in the middle (three encoders) is the only real divergence — and the
-target of this work.
-
-## Proposed Architecture
-
-Insert a single shared encoder between the backends and the existing file
-writer. The shared encoder accepts **only a canonical frame format** —
-`np.ndarray (T, H, W, 3) uint8` RGB. Each backend owns a small `to_canonical()`
-converter that maps *its own* native output into that format before calling
-`encode_video()`. Conversion logic that operates purely in the canonical domain
-(float→uint8 scaling, alpha drop, PIL→array stacking, contiguity) lives once in
-`dynamo.common` as small primitives; each backend converter composes those
-primitives with its own shape mapping.
-
-This keeps backend-specific shape knowledge inside the backend that produces it,
-and gives the shared encoder a single, narrow, well-typed input contract — no
-runtime type-sniffing, and adding a new backend never touches `dynamo.common`.
-
-> **Design note — why not one shared converter?** An earlier draft placed a
-> single `to_canonical_frames()` in `dynamo.common` that sniffed all three
-> backend shapes. That reintroduces the very "N-times change" coupling this DEP
-> removes (a new backend means editing shared code) and inverts the dependency
-> direction (shared infra knowing backend internals). Pushing conversion to the
-> producing edge fixes both.
-
-```mermaid
-graph LR
-    V[vLLM frames] --> Cv[vLLM<br/>to_canonical]
-    T[TRT-LLM frames] --> Ct[TRT-LLM<br/>to_canonical]
-    S[SGLang frames] --> Cs[SGLang<br/>to_canonical]
-
-    P[dynamo.common<br/>canonical primitives] -.shared by.-> Cv
+    P[dynamo.common primitives<br/>ensure_uint8_rgb / pil_frames_to_array / drop_alpha] -.shared by.-> Cv
     P -.-> Ct
     P -.-> Cs
 
@@ -181,198 +96,143 @@ graph LR
     Ct --> U
     Cs --> U
 
-    U -->|NVIDIA| N[imageio → ffmpeg<br/>NVENC]
-    U -->|new HW / codecs| F[ffmpeg CLI<br/>raw pipe]
+    U -->|default| SW[imageio → ffmpeg<br/>libvpx-vp9, software]
+    U -->|DYN_XPU_FFMPEG_PATH set| HW[ffmpeg CLI → VA-API<br/>av1_vaapi, hardware]
 
-    N --> W[upload_to_fs / fs.pipe<br/>unchanged]
-    F --> W
-    W --> D[(file:// / s3:// …)]
+    SW --> W[upload_to_fs<br/>unchanged]
+    HW --> W
 ```
 
-### Canonical frame format (encoder ABI)
+### Canonical frame format
 
-`encode_video()` accepts exactly one input shape and validates it on entry
-(raising `ValueError` on wrong ndim, channel count, or dtype):
+`encode_video()` accepts exactly one input and validates it on entry:
+`np.ndarray`, shape `(T, H, W, 3)`, dtype `uint8`, range `0–255`, channel order
+RGB.
 
-| Aspect | Contract |
+Each backend owns a small `to_canonical()` next to the handler that produces the
+frames, composed from shared canonical-domain primitives (`ensure_uint8_rgb`,
+`pil_frames_to_array`, `drop_alpha`). Backend-specific shape knowledge stays in
+the backend, so adding a fourth backend never edits `dynamo.common`, and the
+shared encoder needs no runtime type sniffing.
+
+### The two encoders
+
+| | Default | Hardware |
+|---|---|---|
+| Encoder | `libvpx-vp9`, software | `av1_vaapi`, Intel VA-API |
+| Driven by | imageio → the image's LGPL ffmpeg | the operator's ffmpeg, via CLI with raw frames on stdin |
+| Selected when | `DYN_XPU_FFMPEG_PATH` is unset | `DYN_XPU_FFMPEG_PATH` names an executable |
+| Container | mp4 | mp4 |
+
+The container is always mp4; every backend already rejected anything else during
+request validation, so this narrows nothing. Neither codec is royalty-bearing.
+H.264 and H.265 are excluded in both software and hardware form — Intel media
+engines can encode them, but doing so would put a royalty-bearing surface back
+into a distributed image, which is exactly what the compliance gate forbids. VP9
+is decode-only on current Intel silicon, so it has no hardware path; AV1 gives us
+hardware encode without the licensing problem.
+
+The CLI is required for the hardware path because imageio's ffmpeg plugin does
+not expose VA-API device selection or hardware filter chains (`format=nv12,hwupload`).
+
+Two environment variables, both read by the shared encoder:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `DYN_XPU_FFMPEG_PATH` | Path to a VA-API-capable ffmpeg. Its presence is the only encoder switch. | unset → software VP9 |
+| `DYN_XPU_VIDEO_DEVICE` | DRM render node for VA-API. | `/dev/dri/renderD128` |
+
+Selection is deliberately **not** auto-detected. `ffmpeg -encoders` advertises
+wrappers the driver cannot run — `vp9_vaapi` lists cleanly and then fails at
+runtime with "No usable encoding entrypoint found" — so probing yields false
+positives. The operator declares hardware support by setting the path.
+
+## Error handling
+
+Every failure is raised, and **no failure falls back to the other encoder**.
+
+| Condition | Result |
 |---|---|
-| Type | `np.ndarray` |
-| Shape | `(T, H, W, 3)` |
-| dtype | `uint8` |
-| Range | `0–255` |
-| Channel order | RGB |
+| `frames` is not canonical `(T, H, W, 3) uint8` | `ValueError`, before any encoder runs |
+| `DYN_XPU_FFMPEG_PATH` set but not an executable file | `RuntimeError` naming the variable and both alternatives |
+| Hardware ffmpeg exits non-zero | `RuntimeError` including ffmpeg's stderr |
+| `imageio` not importable | `ImportError` with the install hint |
 
-**Per-backend converters** (each lives in its own package, next to the handler
-that produces the frames):
+The no-fallback rule is the load-bearing decision. A silent downgrade from
+hardware to software would hide a deployment error behind a large, unexplained
+change in encode cost and output characteristics: the operator asked for hardware
+encoding and should hear that they did not get it. Frame validation raising
+before dispatch means a backend converter bug surfaces as a precise contract
+violation rather than as an opaque ffmpeg error.
 
-| Backend | Native output | Converter |
-|---|---|---|
-| vLLM | `stage_output.images` — list holding one 5-D array | `dynamo.vllm` `to_canonical()` |
-| TensorRT-LLM | `torch.Tensor (1, T, H, W, C)` | `dynamo.trtllm` `to_canonical()` |
-| SGLang | `list[PIL.Image \| np.ndarray]` | `dynamo.sglang` `to_canonical()` |
+`validate_video_encoder_config()` performs the same resolution and logs the
+result, so a worker can report its encoder at startup instead of on the first
+request. It is available but not yet wired into any worker's startup path.
 
-**Shared canonical-domain primitives** in `dynamo.common` (no backend
-knowledge), composed by the converters — e.g. `ensure_uint8_rgb(arr)`,
-`pil_frames_to_array(list)`, `drop_alpha(arr)`.
+## Tests
 
-### Two encode paths
+Encoder behaviour is tested once against canonical arrays, with no backend
+knowledge; each backend tests only its own converter and handler adapter. All
+suites are mocked apart from one real round trip, and all are marked `unit`,
+`pre_merge`, `gpu_0` plus the backend marker, so CI's marker expressions pick
+them up with no workflow change and no GPU.
 
-| Path | When | Why this mechanism |
-|---|---|---|
-| **imageio → ffmpeg (NVENC)** | NVIDIA platforms (current behavior) | Keeps the proven, working path; minimal risk; no behavior change for existing users. |
-| **ffmpeg CLI (raw pipe)** | New hardware / codecs | imageio's ffmpeg plugin does **not** expose the options needed for hardware acceleration on non-NVIDIA encoders (device selection, `hwupload`, hardware filter chains). Driving `ffmpeg` directly via the command line (piping raw frames to stdin) is the only way to reach those encoders and to add codecs imageio doesn't surface. |
+**Added** — `common/tests/test_video_utils.py`:
 
-The key principles: **(a)** the existing NVENC path is preserved unchanged;
-**(b)** the file-writing stage (`upload_to_fs`) is untouched; **(c)** codec /
-hardware divergence collapses into one dispatch point; **(d)** the encoder's
-input is the canonical format only — all backend-shape divergence is resolved
-*before* the shared layer, inside each backend's `to_canonical()`.
-
-## Codecs and Hardware Support
-
-### Table 3a — Current hardware support
-
-| Backend | CPU/software | NVIDIA (NVENC) |
-|---|---|---|
-| vLLM | ✅ (libx264) | — |
-| TensorRT-LLM | (fallback) | ✅ |
-| SGLang | (fallback) | ✅ |
-
-### Table 3b — Current codecs / containers
-
-| Codec | Container | Available in |
-|---|---|---|
-| H.264 / AVC | mp4 | all three |
-| VP9 | webm | TRT-LLM (encoder-capable; handler-gated) |
-
-### Table 3c — Unified encoder support (target)
-
-| Capability | Current | Unified target |
-|---|---|---|
-| Software (CPU) | ✅ | ✅ |
-| NVIDIA NVENC | ✅ | ✅ |
-| **New accelerator (XPU)** | — | ✅ (new ffmpeg-CLI path) |
-| H.264 / AVC | ✅ | ✅ |
-| VP9 | partial | ✅ |
-| **HEVC / H.265** | — | ✅ |
-| mp4 container | ✅ | ✅ |
-| webm container | partial | ✅ |
-
-> Net effect: the unified encoder supports **everything supported today, plus**
-> a new hardware accelerator and additional codecs (notably HEVC), without
-> changing any backend's generation code.
-
-## Encoding Controls
-
-### Table 4a — Controls available today
-
-| Control | Mechanism | Notes |
-|---|---|---|
-| Response format (`url` / `b64_json`) | request field `response_format` | per-request |
-| Container (`output_format`) | request field | effectively mp4-only (handlers reject others) |
-| FPS | request field `fps` / `nvext.fps` | per-request |
-| Codec | — | hardcoded (`h264_nvenc` / libx264) |
-| Hardware accelerator | — | hardcoded per backend |
-| Hardware device | — | not selectable (except `DYNAMO_VAAPI_DEVICE`, local POC) |
-
-### Table 4b — Controls to add
-
-| Control | Values | Default behavior | Override |
-|---|---|---|---|
-| Codec selection | H.264 / HEVC / VP9 | container-appropriate default | explicit |
-| Container | mp4 / webm | mp4 | explicit |
-| HW acceleration | NVENC / XPU / CPU | **auto-detect** from platform | force a specific encoder (incl. CPU) |
-| HW device selection | NVIDIA device index; XPU DRM render node | first available | explicit per accelerator |
-
-### Configuration mechanism
-
-The codebase already uses a **`flag_name` + `env_var`** pattern (e.g.
-`--http-host` / `DYN_HTTP_HOST`), and a device-selection env var precedent
-already exists (`DYNAMO_VAAPI_DEVICE`). Both CLI flags and env vars are
-therefore feasible.
-
-**Recommendation:** because the encoder lives in shared infra
-(`dynamo.common`) and must serve three separate backend arg parsers, use
-**environment variables as the universal baseline** (one set of `DYN_VIDEO_*`
-knobs read by the shared encoder), with **optional per-backend CLI flags**
-layered on top later following the existing `flag_name`/`env_var` convention.
-This keeps the shared layer self-contained while still allowing CLI overrides
-where a backend wants them.
-
-| Proposed knob | Example env var | Example CLI (optional) |
-|---|---|---|
-| Codec | `DYN_VIDEO_CODEC` | `--video-codec` |
-| Container | `DYN_VIDEO_CONTAINER` | `--video-container` |
-| HW accelerator | `DYN_VIDEO_HW_ACCEL` (`auto`/`nvenc`/`xpu`/`cpu`) | `--video-hw-accel` |
-| HW device | `DYN_VIDEO_DEVICE` (index or render node) | `--video-device` |
-
-## Testing
-
-## Principle
-
-The encoder is now one shared component with a narrow canonical ABI, so the
-tests mirror that split:
-
-* **Encoder behavior is tested once, in `dynamo.common`**, against canonical
-  arrays — the shared suite has *no* backend knowledge.
-* **Each backend tests only its own `to_canonical()` converter and its handler
-  adapter.**
-
-No encoder logic is duplicated per backend, and "this backend emits shape X"
-lives with the backend, never in `dynamo.common`.
-
-## Layer A — Shared encoder suite (`dynamo.common`)
-
-Location: `components/src/dynamo/common/tests/test_video_utils.py`.
-
-| Area | What it checks |
+| Group | Covers |
 |---|---|
-| Canonical primitives (`ensure_uint8_rgb`, `pil_frames_to_array`, `drop_alpha`) | float→uint8 scaling, alpha drop, PIL→array stacking, contiguity |
-| `encode_video()` ABI validation | rejects non-canonical input (wrong ndim / channel count / dtype) with `ValueError` |
-| `encode_video()` dispatch | control-resolution order (arg > `DYN_VIDEO_*` env > auto-detect) and `auto` → `nvenc`/`xpu`; both encode paths mocked |
-| ffmpeg-CLI path | mock `shutil.which` / `subprocess.run`; assert the VA-API command line |
-| Real round-trip (`skipif` no ffmpeg) | encode N canonical frames → demux/decode → assert frame count, `W×H`, container magic — the one test that touches a real bitstream |
+| `TestEncodeVideoValidation` | non-ndarray, wrong ndim, wrong channel count, wrong dtype all raise `ValueError` |
+| `TestEncoderSelection` | software when unset, hardware when set, blank treated as unset, unusable path is a hard error with no software call, render-node default and override |
+| `TestAv1VaapiCommandLine` | `av1_vaapi` selected, declared binary invoked, render node and `hwupload` present, quality set explicitly, mp4 output, non-zero exit raises with stderr |
+| `TestValidateVideoEncoderConfig` | passes when unset, raises on a bad path |
+| `TestEncodeVideoRoundTrip` | real encode → decode of a synthetic clip: mp4 magic, frame count, `W×H`, and a PSNR floor of 35 dB |
 
-## Layer B — Backend adapter suites (per backend)
+**Added** — per-backend converter round trips (`TestVllmVideoToCanonical`,
+`TestTrtllmToCanonical`, `TestSglangVideoToCanonical` in each backend's `tests/`):
+build a known-truth canonical array with distinctive per-pixel values, synthesize
+the backend's real native shape from it, convert back, and assert bit-exact
+equality. Distinctive values are what catch axis and channel-order bugs,
+including a U/V swap.
 
-Location: each backend's own `tests/`.
+**Changed** — handler adapter tests in all three backends now assert that
+`encode_video` receives canonical frames and `fps` only, and that no `container`
+or `codec` kwarg is passed, since neither is a caller choice any more. The
+TRT-LLM suite's `output_format` kwarg assertions were replaced by the observable
+result (`output_format == "mp4"` in the response). The vLLM formatter's patch
+helper shrank from five patch targets to four as `normalize_video_frames` /
+`frames_to_numpy` / `encode_to_video_bytes` gave way to `to_canonical` /
+`encode_video`.
 
-| Test | What it checks |
-|---|---|
-| `to_canonical()` round-trip | build a known-truth canonical array with **distinctive per-pixel values** → synthesize the backend's real native shape from it → `to_canonical()` → assert **bit-exact equal** to the truth (distinctive values catch axis / channel-order bugs) |
-| Handler adapter | run the handler with `encode_video` patched; assert it passes canonical frames and forwards `fps` / `container` |
-| Response wrapping | `url` → storage upload; `b64_json` → base64 of the returned bytes |
-
-## Migration of existing tests
-
-| Test file | Change |
-|---|---|
-| `…/trtllm/tests/test_trtllm_video_diffusion.py` | Repatch the ≈9 `encode_to_video_bytes` sites to `encode_video`; drop the `output_format=` kwarg assertions (now `container=`, `fps` positional); move frame-shape handling into the new `to_canonical()` round-trip test |
-| `…/common/tests/test_video_utils.py` | Keep the `encode_to_video_bytes` coverage (function retained); add the Layer-A cases above. The removed `to_canonical_frames` god-function has no direct test — it is replaced by the primitives (Layer A) plus per-backend converters (Layer B) |
-| SGLang / vLLM-Omni video output | Add Layer-B suites (converter round-trip + handler adapter); no old inline encoder is mocked today, so nothing breaks |
-
-## CI placement — what we add, where it lands
-
-CI selects tests by **marker expression** (`pytest -m "…"`) over a repo-wide
-collection — no test file is enumerated in any workflow, so a correctly placed
-and marked file is picked up automatically. Every test carries one marker from
-each of Lifecycle / Test Type / Hardware (enforced by the `pytest-marker-report`
-pre-commit hook), and all markers are pre-registered (`--strict-markers`).
-
-| File | Markers | CI job (marker expr) |
-|---|---|---|
-| `components/src/dynamo/common/tests/test_video_utils.py` | `unit`, `pre_merge`, `gpu_0` (no backend marker) | CPU job: `pre_merge and not (vllm or sglang or trtllm) and gpu_0` |
-| `components/src/dynamo/trtllm/tests/test_trtllm_video_diffusion.py` | `unit`, `trtllm`, `pre_merge`, `gpu_0` | TRT-LLM job: `pre_merge and trtllm and gpu_0` |
-| `components/src/dynamo/vllm/tests/…` (Layer-B) | `unit`, `vllm`, `pre_merge`, `gpu_0` | vLLM job: `pre_merge and vllm and gpu_0` |
-| `components/src/dynamo/sglang/tests/…` (Layer-B) | `unit`, `sglang`, `pre_merge`, `gpu_0` | SGLang job: `pre_merge and sglang and gpu_0` |
-
-> Placement note: SGLang tests go under `sglang/tests/`, **not**
-> `sglang/request_handlers/` — the latter is excluded from pytest collection by
-> an `--ignore-glob` in `pyproject.toml`. All suites are fully mocked; the real
-> round-trip is CPU / libx264 and `skipif`-guarded, so no job needs a GPU.
+The round trip is the only test that touches a real bitstream, and it skips
+rather than fails when no encoder or decoder is present.
 
 # Alternate Solutions
 
-N/A — the only considered alternative was leaving each backend's encoder in
-place (status quo), which keeps the N-times duplication and was rejected for the
-reasons given in Motivation.
+## Alt 1 — One shared converter in `dynamo.common`
+
+A single `to_canonical_frames()` that sniffs all three backend shapes.
+
+**Reason rejected:** it reintroduces the N-times coupling this DEP removes — a
+new backend means editing shared code — and inverts the dependency direction, so
+that shared infrastructure knows backend internals. Pushing conversion to the
+producing edge fixes both.
+
+## Alt 2 — Auto-detect the hardware encoder
+
+Probe `ffmpeg -encoders` and use hardware when it appears available.
+
+**Reason rejected:** the probe is unreliable. Advertised VA-API wrappers fail at
+runtime on drivers that do not implement them, so auto-detection produces
+confident false positives and an unpredictable encoder per host.
+
+## Alt 3 — Expose codec and container per request
+
+**Reason rejected:** the shipped images carry exactly one software and one
+hardware encoder, both mp4. A codec parameter would be a promise the deployment
+cannot keep, and it would make the response format depend on the request rather
+than on the deployment.
+
+## Alt 4 — Status quo
+
+**Reason rejected:** keeps three encoders and the N-times change, and two of the
+three still name codecs that the shipped images no longer contain.
