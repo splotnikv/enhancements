@@ -1,4 +1,4 @@
-# Unified Video Encoder for Dynamo Diffusion Backends
+# Optional Intel AV1 Hardware Encoding for Generated Video
 
 **Status**: Draft
 
@@ -16,136 +16,188 @@
 
 **Review Date**: [Date for review]
 
-**Implementation PR / Tracking Issue**: https://github.com/ai-dynamo/dynamo/pull/11121
+**Implementation PR / Tracking Issue**: [To be filed]
+
+# Revision note
+
+An earlier revision of this DEP, "Unified Video Encoder", proposed a new shared
+entry point (`encode_video()`), per-backend frame converters, and the hardware
+encoder in one change. Review split that up:
+
+* The consolidation that was actually missing — SGLang onto the shared batch
+  encoder the other two backends already used — landed on its own in
+  [ai-dynamo/dynamo#11121](https://github.com/ai-dynamo/dynamo/pull/11121). No
+  new entry point and no converters were needed.
+* CMAF streaming is DEP 0017
+  ([ai-dynamo/dynamo#15171](https://github.com/ai-dynamo/dynamo/pull/15171)),
+  software-only.
+* What remains for this DEP is the hardware encoder, for both paths, on top of
+  those two.
 
 # Summary
 
-Dynamo serves video generation through three backends — **vLLM** (via vLLM-Omni),
-**TensorRT-LLM**, and **SGLang** — and each one re-implements the final "raw
-frames → encoded video" step with its own codec and hardware assumptions. This
-DEP replaces those three implementations with a single shared encoder,
-`dynamo.common.utils.video_utils.encode_video()`, that takes one canonical frame
-format and emits mp4 bytes.
+Dynamo encodes generated video with software VP9 (`libvpx-vp9`), the only video
+encoder its runtime images carry. This DEP adds an **optional hardware encoder
+for Intel GPUs**: AV1 over VA-API (`av1_vaapi`), selected at deployment time by
+pointing `DYN_XPU_FFMPEG_PATH` at a VA-API-capable ffmpeg.
 
-The encoder ships two royalty-free encoders and no codec matrix: **software VP9
-by default**, and **hardware AV1 over VA-API** when the operator points
-`DYN_XPU_FFMPEG_PATH` at a VA-API-capable ffmpeg.
+One switch covers both video outputs:
+
+* the batch route, `/v1/videos`, for all three backends (vLLM-Omni,
+  TensorRT-LLM, SGLang), because they share one encoder function;
+* the CMAF streaming route, `/v1/videos/stream/cmaf` (DEP 0017).
+
+With the variable unset nothing changes: the software path is not touched.
 
 # Motivation
 
-The three backends share the frontend, the request schema, and the storage layer.
-Encoding is the only genuinely divergent step, so adding hardware or a codec is
-an N-times change today and produces inconsistent output across backends.
+The shipped images carry no royalty-bearing encoder. Upstream PR #11836 removed
+H.264, including `h264_nvenc`, and added a build-time gate
+(`container/compliance/`) that fails the build if one returns, so the in-tree
+ffmpeg encodes VP9 in software and nothing else.
 
-The first draft of this DEP proposed preserving the existing NVENC H.264 path and
-adding HEVC alongside it. That is no longer possible: upstream PR #11836 removed
-every royalty-bearing encoder from the shipped images, including `h264_nvenc`,
-and added a build-time gate (`container/compliance/`) that fails the build if one
-returns. The in-tree ffmpeg is now LGPL-only. So the unified encoder is not
-"everything we had, plus more" — it is a **narrower, royalty-free codec surface**
-that happens to be identical across all three backends, with hardware encode
-reached through AV1 rather than H.264.
+On an Intel GPU that leaves the media engine idle while the CPU encodes. AV1 is
+the way to use it without reopening the licensing question: it is royalty-free,
+and current Intel GPUs encode it in hardware. H.264 and H.265 stay excluded in
+hardware form too — the GPU can encode them, but offering them would put a
+royalty-bearing codec surface back into a distributed product. VP9 is not an
+option: on the Arc Pro B60 this was validated on, the driver exposes VP9 for
+decode only.
+
+For streaming there is a second consideration. The CMAF path runs libvpx at
+its fastest setting (`-deadline realtime -cpu-used 8`), which is a
+speed-for-quality trade made so that software encoding does not hold segments
+back. The hardware encoder needs no such setting.
 
 ## Goals
 
-* One shared frames→bytes entry point for all three backends.
-* A single narrow input contract, so the shared layer holds no backend knowledge.
-* Hardware encode on Intel XPU without reintroducing a royalty-bearing codec.
-* Deployment-time selection of the encoder, with no silent fallback.
+* Hardware encoding on Intel GPUs without a royalty-bearing codec.
+* One deployment-time switch for the batch route and the streaming route.
+* No silent fallback in either direction.
+* The software default unchanged, and the change revertible on its own.
 
 ### Non Goals
 
-* Changing the frontend, request schema, or storage layer.
-* Any codec or container choice exposed to the caller or the request.
+* Shipping a VA-API ffmpeg or an Intel media driver in any image. Both are
+  supplied by the operator.
 * Capability auto-detection.
-* Removing the superseded helpers (`encode_to_mp4`, `encode_to_video_bytes`,
-  `normalize_video_frames`, `frames_to_numpy`) — they retain their tests and no
-  longer sit on any request path, but deleting them is a separate cleanup.
+* Any codec or container choice exposed to the caller or the request.
+* Hardware encoders of other vendors; software AV1; H.264 or H.265 in any form.
+* Changes to the frontend, the request schema, or the CMAF wire format. The
+  CMAF metadata frame already carries the codec string of the stream.
 
 # Proposal
 
-## Current implementation
-
-Stages before and after encoding are already shared: the frontend routes
-`/v1/videos`, `NvCreateVideoRequest` / `VideoNvExt` is the common schema, and
-`upload_to_fs()` persists the bytes. Only the encode step diverges.
-
-| | vLLM (vLLM-Omni) | TensorRT-LLM | SGLang |
-|---|---|---|---|
-| Encode call | `DiffusionFormatter._encode_video()` | `encode_to_video_bytes()` (shared helper) | `_frames_to_video()`, inline in the handler |
-| Mechanism | diffusers `export_to_video` → ffmpeg | `imageio.v3.imwrite` → ffmpeg | `imageio.get_writer` → ffmpeg |
-| Codec | H.264, software | H.264 NVENC; VP9 for webm | H.264 NVENC |
-| Native frame type | `stage_output.images`, a list holding one 5-D array | `torch.Tensor (1, T, H, W, C)` uint8 | `list[PIL.Image \| np.ndarray]` |
-
-Three encoders, three native frame layouts, and codec choices that no longer
-exist in the shipped images.
-
-## Proposed architecture
-
 ```mermaid
 graph LR
-    V[vLLM frames] --> Cv[dynamo.vllm<br/>to_canonical]
-    T[TRT-LLM frames] --> Ct[dynamo.trtllm<br/>to_canonical]
-    S[SGLang frames] --> Cs[dynamo.sglang<br/>to_canonical]
+    V[vLLM-Omni] --> B[encode_to_video_bytes]
+    T[TensorRT-LLM] --> B
+    S[SGLang] --> B
+    B -->|default| SW1[imageio<br/>libvpx-vp9]
+    B -->|DYN_XPU_FFMPEG_PATH set| HW1[ffmpeg CLI<br/>av1_vaapi, complete mp4]
 
-    P[dynamo.common primitives<br/>ensure_uint8_rgb / pil_frames_to_array / drop_alpha] -.shared by.-> Cv
-    P -.-> Ct
-    P -.-> Cs
+    C[CMAF session<br/>DEP 0017] -->|default| SW2[ffmpeg CLI<br/>libvpx-vp9, fragmented mp4]
+    C -->|DYN_XPU_FFMPEG_PATH set| HW2[ffmpeg CLI<br/>av1_vaapi, fragmented mp4]
 
-    Cv --> U{encode_video<br/>canonical only}
-    Ct --> U
-    Cs --> U
-
-    U -->|default| SW[imageio → ffmpeg<br/>libvpx-vp9, software]
-    U -->|DYN_XPU_FFMPEG_PATH set| HW[ffmpeg CLI → VA-API<br/>av1_vaapi, hardware]
-
-    SW --> W[upload_to_fs<br/>unchanged]
-    HW --> W
+    K[ffmpeg_command.py<br/>selection + argv] -.-> HW1
+    K -.-> SW2
+    K -.-> HW2
 ```
 
-### Canonical frame format
+## Selection and configuration
 
-`encode_video()` accepts exactly one input and validates it on entry:
-`np.ndarray`, shape `(T, H, W, 3)`, dtype `uint8`, range `0–255`, channel order
-RGB.
+Two environment variables, read where the encode happens:
 
-Each backend owns a small `to_canonical()` next to the handler that produces the
-frames, composed from shared canonical-domain primitives (`ensure_uint8_rgb`,
-`pil_frames_to_array`, `drop_alpha`). Backend-specific shape knowledge stays in
-the backend, so adding a fourth backend never edits `dynamo.common`, and the
-shared encoder needs no runtime type sniffing.
+| Variable | Meaning | Default |
+|---|---|---|
+| `DYN_XPU_FFMPEG_PATH` | Path to an ffmpeg built with VA-API and `av1_vaapi`. Its presence is the only encoder switch. | unset → software VP9 |
+| `DYN_XPU_VIDEO_DEVICE` | DRM render node of the GPU that encodes. Read only when hardware is selected. | `/dev/dri/renderD128` |
 
-### The two encoders
+Selection is deliberately **not** auto-detected. `ffmpeg -encoders` lists VA-API
+wrappers the driver cannot run — `vp9_vaapi` lists cleanly and then fails at
+runtime with "No usable encoding entrypoint found" — so probing yields false
+positives. The operator declares hardware support by setting the path.
+
+On a host with several GPUs the render node is not derived from the device the
+model runs on; the operator sets both. They can name the same GPU or different
+ones.
+
+## The two encoders
 
 | | Default | Hardware |
 |---|---|---|
 | Encoder | `libvpx-vp9`, software | `av1_vaapi`, Intel VA-API |
-| Driven by | imageio → the image's LGPL ffmpeg | the operator's ffmpeg, via CLI with raw frames on stdin |
 | Selected when | `DYN_XPU_FFMPEG_PATH` is unset | `DYN_XPU_FFMPEG_PATH` names an executable |
+| Batch route driven by | imageio → the image's LGPL ffmpeg | the operator's ffmpeg, via CLI, raw frames on stdin |
+| Streaming route driven by | the image's LGPL ffmpeg, via CLI | the operator's ffmpeg, via CLI |
 | Container | mp4 | mp4 |
+| Pixel format | yuv420p | yuv420p (`nv12` on the VA-API surface) |
 
-The container is always mp4; every backend already rejected anything else during
-request validation, so this narrows nothing. Neither codec is royalty-bearing.
-H.264 and H.265 are excluded in both software and hardware form — Intel media
-engines can encode them, but doing so would put a royalty-bearing surface back
-into a distributed image, which is exactly what the compliance gate forbids. VP9
-is decode-only on current Intel silicon, so it has no hardware path; AV1 gives us
-hardware encode without the licensing problem.
+The CLI is required for the hardware batch path because imageio's ffmpeg plugin
+does not expose VA-API device selection or hardware filter chains
+(`format=nv12,hwupload`).
 
-The CLI is required for the hardware path because imageio's ffmpeg plugin does
-not expose VA-API device selection or hardware filter chains (`format=nv12,hwupload`).
+## Command construction
 
-Two environment variables, both read by the shared encoder:
+Selection and argv construction live in one new module,
+`dynamo/common/utils/ffmpeg_command.py`. One builder produces the argv for the
+batch hardware encode and for the streaming session with either encoder, so the
+codec identity, the VA-API upload and the quality setting are decided in one
+place.
 
-| Variable | Meaning | Default |
-|---|---|---|
-| `DYN_XPU_FFMPEG_PATH` | Path to a VA-API-capable ffmpeg. Its presence is the only encoder switch. | unset → software VP9 |
-| `DYN_XPU_VIDEO_DEVICE` | DRM render node for VA-API. | `/dev/dri/renderD128` |
+Batch, hardware:
 
-Selection is deliberately **not** auto-detected. `ffmpeg -encoders` advertises
-wrappers the driver cannot run — `vp9_vaapi` lists cleanly and then fails at
-runtime with "No usable encoding entrypoint found" — so probing yields false
-positives. The operator declares hardware support by setting the path.
+```
+ffmpeg -vaapi_device $DYN_XPU_VIDEO_DEVICE \
+       -f rawvideo -pix_fmt rgb24 -s WxH -r FPS -i - \
+       -vf format=nv12,hwupload \
+       -c:v av1_vaapi -global_quality 25 \
+       -movflags +faststart -f mp4 OUT.mp4
+```
+
+Streaming, hardware:
+
+```
+ffmpeg -vaapi_device $DYN_XPU_VIDEO_DEVICE \
+       -f rawvideo -pix_fmt rgb24 -s WxH -r FPS -i - \
+       -vf format=nv12,hwupload \
+       -c:v av1_vaapi -global_quality 25 -g 8 -keyint_min 8 -async_depth 1 \
+       -movflags +frag_keyframe+empty_moov+default_base_moof \
+       -flush_packets 1 -f mp4 pipe:1
+```
+
+| Argument | Why |
+|---|---|
+| `-vf format=nv12,hwupload` | moves the frames onto the VA-API surface; `nv12` is 4:2:0, which the encoder consumes and players expect |
+| `-global_quality 25` | set explicitly so output does not depend on the driver's built-in default; 25 is that default today |
+| `-async_depth 1` | streaming only: the encoder queues frames before returning packets, which would hold a finished fragment back |
+
+The software streaming argv of DEP 0017 is produced by the same builder and is
+unchanged; a test pins it.
+
+## Batch path
+
+`encode_to_video_bytes()` resolves the switch first. When hardware is selected
+it pipes the frames to the declared ffmpeg and reads the result back from a
+temporary file — mp4 with `+faststart` needs a seekable output. Otherwise it
+runs the existing imageio code, which this DEP does not modify.
+
+Two contracts are stricter on the hardware path, because raw bytes carry no
+shape or type and anything else would encode as garbage rather than fail:
+
+* frames must be `np.ndarray (T, H, W, 3) uint8`;
+* the container must be `mp4`, the only one every handler accepts today.
+
+## Streaming path
+
+The CMAF session resolves the same switch when it starts. Everything else in
+DEP 0017 is unchanged: the process model, chunking, the box-header cutter, the
+wire format, the lifecycle.
+
+The codec string in the metadata frame is read from the init segment's `av1C`
+box (`av01.P.LLT.DD`), exactly as the VP9 one is read from `vpcC`, so a client
+that follows DEP 0017 — check `MediaSource.isTypeSupported()` on the metadata's
+`mime_type`, then append — plays the AV1 stream with no change.
 
 ## Error handling
 
@@ -153,71 +205,64 @@ Every failure is raised, and **no failure falls back to the other encoder**.
 
 | Condition | Result |
 |---|---|
-| `frames` is not canonical `(T, H, W, 3) uint8` | `ValueError`, before any encoder runs |
 | `DYN_XPU_FFMPEG_PATH` set but not an executable file | `RuntimeError` naming the variable and both alternatives |
-| Hardware ffmpeg exits non-zero | `RuntimeError` including ffmpeg's stderr |
-| `imageio` not importable | `ImportError` with the install hint |
+| Hardware selected and frames are not `(T, H, W, 3) uint8` | `ValueError`, before any process starts |
+| Hardware selected and the container is not mp4 | `ValueError`, before any process starts |
+| Hardware ffmpeg exits non-zero | `RuntimeError` including its stderr; on the CMAF route, the terminal `error` frame |
+| Hardware ffmpeg exits zero but writes nothing, or exceeds the time limit | `RuntimeError` |
 
 The no-fallback rule is the load-bearing decision. A silent downgrade from
-hardware to software would hide a deployment error behind a large, unexplained
-change in encode cost and output characteristics: the operator asked for hardware
-encoding and should hear that they did not get it. Frame validation raising
-before dispatch means a backend converter bug surfaces as a precise contract
-violation rather than as an opaque ffmpeg error.
+hardware to software would hide a deployment error behind an unexplained change
+in encode cost and in the codec clients receive: the operator asked for hardware
+encoding and should hear that they did not get it.
 
-`validate_video_encoder_config()` performs the same resolution and logs the
-result, so a worker can report its encoder at startup instead of on the first
-request. It is available but not yet wired into any worker's startup path.
+## Operational requirements
+
+* The worker can open the render node.
+* The Intel media driver on the worker supports AV1 encoding on that GPU:
+  `vainfo --display drm --device <node>` lists
+  `VAProfileAV1Profile0 : VAEntrypointEncSlice`.
+* Frames are at least the hardware's minimum size. On an Arc Pro B60 that is
+  128x96; a smaller clip fails with ffmpeg's own message.
+
+Validated on an Arc Pro B60 with Ubuntu 24.04's ffmpeg 6.1.1 and
+`intel-media-va-driver-non-free` 26.3.5 and 26.4.1.
+
+## The software default is unchanged
+
+* The software branch of `encode_to_video_bytes()` is not edited.
+* A test pins the software streaming argv to the one DEP 0017 shipped.
+* With the variable unset, a test asserts that no ffmpeg process is started on
+  the batch path.
+* The tests of #11121 and #15171 pass without modification, apart from one
+  constant that a test now reads from its new module.
+* On the validation host, the batch and CMAF end-to-end checks were repeated
+  with the variable unset.
 
 ## Tests
 
-Encoder behaviour is tested once against canonical arrays, with no backend
-knowledge; each backend tests only its own converter and handler adapter. All
-suites are mocked apart from one real round trip, and all are marked `unit`,
-`pre_merge`, `gpu_0` plus the backend marker, so CI's marker expressions pick
-them up with no workflow change and no GPU.
+No encoder started, no GPU:
 
-**Added** — `common/tests/test_video_utils.py`:
-
-| Group | Covers |
+| Area | What it checks |
 |---|---|
-| `TestEncodeVideoValidation` | non-ndarray, wrong ndim, wrong channel count, wrong dtype all raise `ValueError` |
-| `TestEncoderSelection` | software when unset, hardware when set, blank treated as unset, unusable path is a hard error with no software call, render-node default and override |
-| `TestAv1VaapiCommandLine` | `av1_vaapi` selected, declared binary invoked, render node and `hwupload` present, quality set explicitly, mp4 output, non-zero exit raises with stderr |
-| `TestValidateVideoEncoderConfig` | passes when unset, raises on a bad path |
-| `TestEncodeVideoRoundTrip` | real encode → decode of a synthetic clip: mp4 magic, frame count, `W×H`, and a PSNR floor of 35 dB |
+| Selection | unset and blank mean software; an executable selects hardware; a missing or non-executable path raises and does not select software; render-node default and override |
+| Command construction | exact argv for hardware batch and hardware streaming; the software streaming argv unchanged; no libvpx options reach `av1_vaapi` |
+| Batch, against a stand-in ffmpeg | the declared binary receives the raw frames and the VA-API arguments; non-zero exit raises with stderr; no output raises; non-mp4 and non-uint8 input are refused before any process starts; imageio is never imported |
+| Streaming | the session runs the declared hardware binary; an encoder failure names the hardware encoder; `av1C` parses to the codec string; the AV1 fallback string applies when the init segment cannot be read |
 
-**Added** — per-backend converter round trips (`TestVllmVideoToCanonical`,
-`TestTrtllmToCanonical`, `TestSglangVideoToCanonical` in each backend's `tests/`):
-build a known-truth canonical array with distinctive per-pixel values, synthesize
-the backend's real native shape from it, convert back, and assert bit-exact
-equality. Distinctive values are what catch axis and channel-order bugs,
-including a U/V swap.
+Against a real VA-API encoder, running only where `DYN_XPU_FFMPEG_PATH` is set:
 
-**Changed** — handler adapter tests in all three backends now assert that
-`encode_video` receives canonical frames and `fps` only, and that no `container`
-or `codec` kwarg is passed, since neither is a caller choice any more. The
-TRT-LLM suite's `output_format` kwarg assertions were replaced by the observable
-result (`output_format == "mp4"` in the response). The vLLM formatter's patch
-helper shrank from five patch targets to four as `normalize_video_frames` /
-`frames_to_numpy` / `encode_to_video_bytes` gave way to `to_canonical` /
-`encode_video`.
+| Area | What it checks |
+|---|---|
+| Batch | AV1, yuv420p, every frame, `moov` before `mdat`, decoded picture matches the input |
+| Streaming | fragments decode to every frame; each segment decodes with only the init segment; sequence numbers and decode times are continuous; a 17-frame clip ends in a 1-frame segment; segments arrive while input is still being written; the codec string is `av01.0.*.08` |
 
-The round trip is the only test that touches a real bitstream, and it skips
-rather than fails when no encoder or decoder is present.
+The hardware tests never probe: they run where the operator declared an
+encoder, and skip everywhere else.
 
 # Alternate Solutions
 
-## Alt 1 — One shared converter in `dynamo.common`
-
-A single `to_canonical_frames()` that sniffs all three backend shapes.
-
-**Reason rejected:** it reintroduces the N-times coupling this DEP removes — a
-new backend means editing shared code — and inverts the dependency direction, so
-that shared infrastructure knows backend internals. Pushing conversion to the
-producing edge fixes both.
-
-## Alt 2 — Auto-detect the hardware encoder
+## Alt 1 — Auto-detect the hardware encoder
 
 Probe `ffmpeg -encoders` and use hardware when it appears available.
 
@@ -225,14 +270,29 @@ Probe `ffmpeg -encoders` and use hardware when it appears available.
 runtime on drivers that do not implement them, so auto-detection produces
 confident false positives and an unpredictable encoder per host.
 
+## Alt 2 — Fall back to software when the hardware encode fails
+
+**Reason rejected:** it turns a deployment error into a silent change of codec
+and encode cost. On the streaming route it is not even possible after the init
+segment has gone out, because the client is already decoding against that
+codec configuration.
+
 ## Alt 3 — Expose codec and container per request
 
-**Reason rejected:** the shipped images carry exactly one software and one
-hardware encoder, both mp4. A codec parameter would be a promise the deployment
-cannot keep, and it would make the response format depend on the request rather
-than on the deployment.
+**Reason rejected:** which encoders exist is a property of the deployment. A
+codec parameter would be a promise a deployment may not be able to keep, and it
+would make the response format depend on the request.
 
-## Alt 4 — Status quo
+## Alt 4 — Ship a VA-API ffmpeg in the Intel runtime image
 
-**Reason rejected:** keeps three encoders and the N-times change, and two of the
-three still name codecs that the shipped images no longer contain.
+**Reason deferred:** it would make the feature work out of the box, but it adds
+an ffmpeg with a larger codec surface to an image that the compliance gate
+restricts to one LGPL build, and it ties the image to a media-driver version.
+That is a packaging decision for a follow-up; the encoder code does not depend
+on it.
+
+## Alt 5 — A separate hardware encoder module per path
+
+**Reason rejected:** the batch and streaming paths differ only in output target,
+GOP and muxer flags. Two builders would let the codec identity, the upload
+filter and the quality setting drift apart.
